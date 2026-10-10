@@ -1,24 +1,28 @@
 import json
+import math
 from abc import ABC, abstractmethod
 from pathlib import Path
 
 DATABASE = Path("school_data.json")
 
 
-def load_data():
-    if not DATABASE.exists():
-        return {"students": [], "teachers": []}
+def valid_email(email):
+    email = email.strip()
+    if any(char.isspace() for char in email) or email.count("@") != 1:
+        return False
+    local_part, domain = email.split("@")
+    return bool(
+        local_part
+        and domain
+        and "." in domain
+        and not domain.startswith(".")
+        and not domain.endswith(".")
+        and ".." not in domain
+    )
 
-    try:
-        with DATABASE.open("r", encoding="utf-8") as file:
-            data = json.load(file)
-    except json.JSONDecodeError as error:
-        raise RuntimeError(
-            f"{DATABASE} is not valid JSON. Fix the file before running the program again."
-        ) from error
-    except OSError as error:
-        raise RuntimeError(f"Could not read {DATABASE}: {error}") from error
 
+def validate_data(data):
+    """Check the stored JSON structure before the app uses it."""
     if not isinstance(data, dict):
         raise RuntimeError(f"{DATABASE} must contain a JSON object.")
 
@@ -27,7 +31,64 @@ def load_data():
     if not isinstance(data["students"], list) or not isinstance(data["teachers"], list):
         raise RuntimeError(f"{DATABASE} has an unexpected format.")
 
+    def check_records(records, id_key, record_type):
+        seen_ids = set()
+        required = {
+            "student": {"name", "age", "email", "roll_no", "grades"},
+            "teacher": {"name", "age", "email", "emp_id", "subject"},
+        }[record_type]
+        for record in records:
+            if not isinstance(record, dict) or not required.issubset(record):
+                raise RuntimeError(f"{DATABASE} contains an incomplete {record_type} record.")
+            for field in ("name", "email", id_key):
+                if not isinstance(record[field], str) or not record[field].strip():
+                    raise RuntimeError(f"{DATABASE} contains an invalid {field} in a {record_type} record.")
+            if not isinstance(record["age"], int) or isinstance(record["age"], bool) or record["age"] <= 0:
+                raise RuntimeError(f"{DATABASE} contains an invalid age in a {record_type} record.")
+            if not valid_email(record["email"]):
+                raise RuntimeError(f"{DATABASE} contains an invalid email in a {record_type} record.")
+            record_id = record[id_key].strip().casefold()
+            if record_id in seen_ids:
+                raise RuntimeError(f"{DATABASE} contains duplicate {id_key} values.")
+            seen_ids.add(record_id)
+
+            if record_type == "student":
+                grades = record["grades"]
+                if not isinstance(grades, dict):
+                    raise RuntimeError(f"{DATABASE} contains invalid grades for a student.")
+                for subject, mark in grades.items():
+                    if not isinstance(subject, str) or not subject.strip():
+                        raise RuntimeError(f"{DATABASE} contains an invalid subject name.")
+                    if (
+                        not isinstance(mark, (int, float))
+                        or isinstance(mark, bool)
+                        or not math.isfinite(mark)
+                        or not 0 <= mark <= 100
+                    ):
+                        raise RuntimeError(f"{DATABASE} contains marks outside the 0-100 range.")
+            elif not isinstance(record["subject"], str) or not record["subject"].strip():
+                raise RuntimeError(f"{DATABASE} contains an invalid teacher subject.")
+
+    check_records(data["students"], "roll_no", "student")
+    check_records(data["teachers"], "emp_id", "teacher")
     return data
+
+
+def load_data():
+    if not DATABASE.exists():
+        return {"students": [], "teachers": []}
+
+    try:
+        with DATABASE.open("r", encoding="utf-8") as file:
+            stored_data = json.load(file)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(
+            f"{DATABASE} is not valid JSON. Fix the file before running the program again."
+        ) from error
+    except OSError as error:
+        raise RuntimeError(f"Could not read {DATABASE}: {error}") from error
+
+    return validate_data(stored_data)
 
 
 def save_data(data):
@@ -39,7 +100,7 @@ def save_data(data):
         )
         temporary_file.replace(DATABASE)
         return True
-    except OSError as error:
+    except (OSError, TypeError, ValueError) as error:
         print(f"Could not save data: {error}")
         try:
             temporary_file.unlink(missing_ok=True)
@@ -71,7 +132,7 @@ def ask_mark(prompt="Marks (0-100): "):
         raw_value = input(prompt).strip()
         try:
             mark = float(raw_value)
-            if 0 <= mark <= 100:
+            if math.isfinite(mark) and 0 <= mark <= 100:
                 return mark
         except ValueError:
             pass
@@ -81,17 +142,13 @@ def ask_mark(prompt="Marks (0-100): "):
 def find_by_id(records, key, value):
     target = value.strip().casefold()
     return next(
-        (record for record in records if str(record.get(key, "")).casefold() == target),
+        (record for record in records if str(record.get(key, "")).strip().casefold() == target),
         None,
     )
 
 
-def valid_email(email):
-    email = email.strip()
-    if " " in email or email.count("@") != 1:
-        return False
-    local_part, domain = email.split("@")
-    return bool(local_part and "." in domain and not domain.startswith(".") and not domain.endswith("."))
+def calculate_average(grades):
+    return sum(grades.values()) / len(grades) if grades else 0
 
 
 class Person(ABC):
@@ -125,13 +182,7 @@ class Student(Person):
             print("Invalid email address.")
             return
 
-        student = {
-            "name": name,
-            "age": age,
-            "email": email,
-            "roll_no": roll_no,
-            "grades": {},
-        }
+        student = {"name": name, "age": age, "email": email, "roll_no": roll_no, "grades": {}}
         data["students"].append(student)
         if save_data(data):
             print(f"Student {name} registered successfully.")
@@ -145,15 +196,14 @@ class Student(Person):
             print("Student not found.")
             return
 
-        grades = student.get("grades", {})
-        average = sum(grades.values()) / len(grades) if grades else 0
+        grades = student["grades"]
         print("\nStudent details")
         print(f"Name: {student['name']}")
         print(f"Roll number: {student['roll_no']}")
         print(f"Age: {student['age']}")
         print(f"Email: {student['email']}")
         print(f"Grades: {grades if grades else 'No grades recorded'}")
-        print(f"Average marks: {average:.2f}")
+        print(f"Average marks: {calculate_average(grades):.2f}")
 
     def add_grade(self):
         roll_no = ask_non_empty("Roll number: ")
@@ -164,7 +214,7 @@ class Student(Person):
 
         subject = ask_non_empty("Subject: ")
         mark = ask_mark()
-        grades = student.setdefault("grades", {})
+        grades = student["grades"]
         old_mark = grades.get(subject)
         grades[subject] = mark
         if save_data(data):
@@ -189,11 +239,12 @@ class Student(Person):
             print("Deletion cancelled.")
             return
 
-        data["students"].remove(student)
+        original_index = data["students"].index(student)
+        data["students"].pop(original_index)
         if save_data(data):
             print("Student record deleted.")
         else:
-            data["students"].append(student)
+            data["students"].insert(original_index, student)
 
 
 class Teacher(Person):
@@ -214,13 +265,7 @@ class Teacher(Person):
             return
         subject = ask_non_empty("Subject taught: ")
 
-        teacher = {
-            "name": name,
-            "age": age,
-            "email": email,
-            "subject": subject,
-            "emp_id": emp_id,
-        }
+        teacher = {"name": name, "age": age, "email": email, "subject": subject, "emp_id": emp_id}
         data["teachers"].append(teacher)
         if save_data(data):
             print(f"Teacher {name} registered successfully.")
